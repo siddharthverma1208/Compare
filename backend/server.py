@@ -308,6 +308,189 @@ async def get_grocery_history(user_id: Optional[str] = None, limit: int = 20):
     comparisons = await db.grocery_comparisons.find(query).limit(limit).sort("timestamp", -1).to_list(limit)
     return [GroceryComparison(**comp) for comp in comparisons]
 
+# User preferences endpoints
+@api_router.post("/user/preferences", response_model=UserPreferences)
+async def create_user_preferences(preferences: UserPreferencesCreate):
+    """Create or update user preferences"""
+    existing = await db.user_preferences.find_one({"user_id": preferences.user_id})
+    
+    if existing:
+        # Update existing preferences
+        update_data = preferences.dict()
+        update_data["updated_at"] = datetime.utcnow()
+        await db.user_preferences.update_one(
+            {"user_id": preferences.user_id},
+            {"$set": update_data}
+        )
+        updated = await db.user_preferences.find_one({"user_id": preferences.user_id})
+        return UserPreferences(**updated)
+    else:
+        # Create new preferences
+        new_preferences = UserPreferences(**preferences.dict())
+        await db.user_preferences.insert_one(new_preferences.dict())
+        return new_preferences
+
+@api_router.get("/user/preferences/{user_id}", response_model=UserPreferences)
+async def get_user_preferences(user_id: str):
+    """Get user preferences"""
+    preferences = await db.user_preferences.find_one({"user_id": user_id})
+    if not preferences:
+        raise HTTPException(status_code=404, detail="User preferences not found")
+    return UserPreferences(**preferences)
+
+# Savings tracking endpoints
+@api_router.post("/savings/record", response_model=SavingsRecord)
+async def record_savings(
+    user_id: str,
+    comparison_type: ComparisonType,
+    comparison_id: str,
+    original_price: float,
+    chosen_price: float,
+    provider_chosen: str
+):
+    """Record a savings transaction"""
+    savings_amount = original_price - chosen_price
+    
+    savings_record = SavingsRecord(
+        user_id=user_id,
+        comparison_type=comparison_type,
+        comparison_id=comparison_id,
+        original_price=original_price,
+        chosen_price=chosen_price,
+        savings_amount=savings_amount,
+        provider_chosen=provider_chosen
+    )
+    
+    await db.savings_records.insert_one(savings_record.dict())
+    return savings_record
+
+@api_router.get("/savings/user/{user_id}", response_model=List[SavingsRecord])
+async def get_user_savings(user_id: str, limit: int = 50):
+    """Get user's savings history"""
+    savings = await db.savings_records.find({"user_id": user_id}).limit(limit).sort("timestamp", -1).to_list(limit)
+    return [SavingsRecord(**record) for record in savings]
+
+@api_router.get("/savings/summary/{user_id}")
+async def get_savings_summary(user_id: str):
+    """Get user's savings summary statistics"""
+    pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {
+            "_id": None,
+            "total_savings": {"$sum": "$savings_amount"},
+            "total_transactions": {"$sum": 1},
+            "avg_savings": {"$avg": "$savings_amount"},
+            "ride_savings": {"$sum": {"$cond": [{"$eq": ["$comparison_type", "ride"]}, "$savings_amount", 0]}},
+            "grocery_savings": {"$sum": {"$cond": [{"$eq": ["$comparison_type", "grocery"]}, "$savings_amount", 0]}}
+        }}
+    ]
+    
+    result = await db.savings_records.aggregate(pipeline).to_list(1)
+    if not result:
+        return {
+            "total_savings": 0,
+            "total_transactions": 0,
+            "avg_savings": 0,
+            "ride_savings": 0,
+            "grocery_savings": 0
+        }
+    
+    return result[0]
+
+# Price alerts endpoints
+@api_router.post("/alerts", response_model=PriceAlert)
+async def create_price_alert(alert_data: PriceAlertCreate):
+    """Create a price alert"""
+    # Get current price based on comparison type
+    current_price = 0.0  # Would be fetched from real providers
+    
+    alert = PriceAlert(
+        **alert_data.dict(),
+        current_price=current_price
+    )
+    
+    await db.price_alerts.insert_one(alert.dict())
+    return alert
+
+@api_router.get("/alerts/user/{user_id}", response_model=List[PriceAlert])
+async def get_user_alerts(user_id: str, active_only: bool = True):
+    """Get user's price alerts"""
+    query = {"user_id": user_id}
+    if active_only:
+        query["is_active"] = True
+        
+    alerts = await db.price_alerts.find(query).sort("created_at", -1).to_list(100)
+    return [PriceAlert(**alert) for alert in alerts]
+
+@api_router.delete("/alerts/{alert_id}")
+async def delete_price_alert(alert_id: str):
+    """Delete a price alert"""
+    result = await db.price_alerts.delete_one({"id": alert_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"message": "Alert deleted successfully"}
+
+# Analytics endpoints
+@api_router.get("/analytics/popular-routes")
+async def get_popular_routes(limit: int = 10):
+    """Get most popular ride routes"""
+    pipeline = [
+        {"$group": {
+            "_id": {"pickup": "$pickup_location", "drop": "$drop_location"},
+            "count": {"$sum": 1},
+            "avg_distance": {"$avg": "$distance_km"},
+            "most_chosen_provider": {"$first": "$best_price_provider"}
+        }},
+        {"$sort": {"count": -1}},
+        {"$limit": limit}
+    ]
+    
+    results = await db.ride_comparisons.aggregate(pipeline).to_list(limit)
+    return results
+
+@api_router.get("/analytics/popular-products")
+async def get_popular_products(limit: int = 10):
+    """Get most compared grocery products"""
+    pipeline = [
+        {"$group": {
+            "_id": "$product_name",
+            "count": {"$sum": 1},
+            "avg_savings": {"$avg": {"$subtract": [
+                {"$arrayElemAt": [{"$map": {"input": "$providers", "as": "p", "in": "$$p.price"}}, 0]},
+                {"$min": {"$map": {"input": "$providers", "as": "p", "in": "$$p.price"}}}
+            ]}},
+            "most_chosen_provider": {"$first": "$best_price_provider"}
+        }},
+        {"$sort": {"count": -1}},
+        {"$limit": limit}
+    ]
+    
+    results = await db.grocery_comparisons.aggregate(pipeline).to_list(limit)
+    return results
+
+# Health check and utility endpoints
+@api_router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Test database connection
+        await db.list_collection_names()
+        return {"status": "healthy", "timestamp": datetime.utcnow()}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database connection failed: {str(e)}")
+
+@api_router.get("/providers")
+async def get_supported_providers():
+    """Get list of supported providers"""
+    return {
+        "ride_providers": ["Uber", "Ola", "Rapido", "Namma Yatri"],
+        "grocery_providers": ["Blinkit", "Instamart", "Zepto", "BigBasket"],
+        "coming_soon": {
+            "pharmacy": ["1mg", "Netmeds", "Apollo"],
+            "food": ["Swiggy", "Zomato", "Uber Eats"]
+        }
+    }
+
 # Include the router in the main app
 app.include_router(api_router)
 
