@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -6,9 +6,10 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime
+from enum import Enum
 
 
 ROOT_DIR = Path(__file__).parent
@@ -20,37 +21,292 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 # Create the main app without a prefix
-app = FastAPI()
+app = FastAPI(title="Comparify API", description="Price comparison app backend")
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
 
-# Define Models
-class StatusCheck(BaseModel):
+# Enums
+class ComparisonType(str, Enum):
+    ride = "ride"
+    grocery = "grocery"
+    pharmacy = "pharmacy"
+    food = "food"
+
+class RideVehicleType(str, Enum):
+    auto = "auto"
+    bike = "bike"
+    car = "car"
+    cab = "cab"
+
+# Data Models
+class RideComparison(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
+    user_id: Optional[str] = None
+    pickup_location: str
+    drop_location: str
+    distance_km: float
+    estimated_duration_mins: int
+    providers: List[Dict[str, Any]]  # Provider-specific data
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    best_price_provider: str
+    best_time_provider: str
+
+class RideComparisonCreate(BaseModel):
+    pickup_location: str
+    drop_location: str
+    distance_km: float
+    estimated_duration_mins: int
+    user_id: Optional[str] = None
+
+class GroceryComparison(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: Optional[str] = None
+    product_name: str
+    brand: Optional[str] = None
+    category: str
+    search_query: str
+    providers: List[Dict[str, Any]]  # Provider-specific data with normalized prices
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    best_price_provider: str
+    best_delivery_provider: str
+
+class GroceryComparisonCreate(BaseModel):
+    product_name: str
+    brand: Optional[str] = None
+    category: str
+    search_query: str
+    user_id: Optional[str] = None
+
+class UserPreferences(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    preferred_providers: Dict[str, List[str]]  # {ride: [uber, ola], grocery: [blinkit]}
+    budget_limits: Dict[str, float]  # {ride: 200, grocery: 500}
+    notification_settings: Dict[str, bool]
+    location_preferences: Dict[str, str]  # Default pickup/delivery addresses
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class UserPreferencesCreate(BaseModel):
+    user_id: str
+    preferred_providers: Optional[Dict[str, List[str]]] = {}
+    budget_limits: Optional[Dict[str, float]] = {}
+    notification_settings: Optional[Dict[str, bool]] = {}
+    location_preferences: Optional[Dict[str, str]] = {}
+
+class SavingsRecord(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    comparison_type: ComparisonType
+    comparison_id: str
+    original_price: float
+    chosen_price: float
+    savings_amount: float
+    provider_chosen: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+class PriceAlert(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    comparison_type: ComparisonType
+    product_name: Optional[str] = None  # For groceries
+    route: Optional[str] = None  # For rides (pickup-drop)
+    target_price: float
+    current_price: float
+    is_active: bool = True
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_checked: datetime = Field(default_factory=datetime.utcnow)
 
-# Add your routes to the router instead of directly to app
+class PriceAlertCreate(BaseModel):
+    user_id: str
+    comparison_type: ComparisonType
+    product_name: Optional[str] = None
+    route: Optional[str] = None
+    target_price: float
+
+# Mock data generators for development
+def generate_mock_ride_providers(pickup: str, drop: str, distance: float):
+    return [
+        {
+            "provider": "Uber",
+            "vehicle_type": "UberGo",
+            "estimated_fare": 120,
+            "estimated_time": "8-12 mins",
+            "surge_multiplier": 1.0,
+            "coupon_discount": 20,
+            "wallet_balance": 0,
+            "features": ["AC Car", "GPS Tracking", "24/7 Support"]
+        },
+        {
+            "provider": "Ola",
+            "vehicle_type": "Mini",
+            "estimated_fare": 110,
+            "estimated_time": "10-15 mins",
+            "surge_multiplier": 1.2,
+            "coupon_discount": 0,
+            "wallet_balance": 50,
+            "features": ["AC Car", "Safety Features", "Easy Cancellation"]
+        },
+        {
+            "provider": "Rapido",
+            "vehicle_type": "Bike",
+            "estimated_fare": 35,
+            "estimated_time": "12-18 mins",
+            "surge_multiplier": 1.0,
+            "coupon_discount": 0,
+            "wallet_balance": 0,
+            "features": ["Fastest Route", "Helmet Provided", "Eco-Friendly"]
+        },
+        {
+            "provider": "Namma Yatri",
+            "vehicle_type": "Auto",
+            "estimated_fare": 65,
+            "estimated_time": "15-20 mins",
+            "surge_multiplier": 1.0,
+            "coupon_discount": 0,
+            "wallet_balance": 0,
+            "features": ["Fixed Fare", "No Commission", "Local Drivers"]
+        }
+    ]
+
+def generate_mock_grocery_providers(product_name: str):
+    return [
+        {
+            "provider": "Blinkit",
+            "product_name": product_name,
+            "brand": "India Gate",
+            "size": "5 kg",
+            "price": 520,
+            "mrp": 550,
+            "price_per_unit": 104,
+            "unit": "kg",
+            "delivery_fee": 0,
+            "delivery_time": "10-15 mins",
+            "discount": 30,
+            "rating": 4.4,
+            "review_count": 2100,
+            "in_stock": True,
+            "offers": ["First Order 10% Off", "Free Delivery"]
+        },
+        {
+            "provider": "Instamart", 
+            "product_name": product_name,
+            "brand": "India Gate",
+            "size": "5 kg",
+            "price": 540,
+            "mrp": 580,
+            "price_per_unit": 108,
+            "unit": "kg",
+            "delivery_fee": 25,
+            "delivery_time": "15-25 mins",
+            "discount": 40,
+            "rating": 4.3,
+            "review_count": 750,
+            "in_stock": True,
+            "offers": ["Weekend Special", "Bulk Order Discount"]
+        },
+        {
+            "provider": "Zepto",
+            "product_name": product_name,
+            "brand": "India Gate", 
+            "size": "5 kg",
+            "price": 535,
+            "mrp": 550,
+            "price_per_unit": 107,
+            "unit": "kg",
+            "delivery_fee": 0,
+            "delivery_time": "8-12 mins",
+            "discount": 15,
+            "rating": 4.5,
+            "review_count": 890,
+            "in_stock": True,
+            "offers": ["Free Delivery", "Express Delivery"]
+        },
+        {
+            "provider": "BigBasket",
+            "product_name": product_name,
+            "brand": "India Gate",
+            "size": "5 kg", 
+            "price": 510,
+            "mrp": 600,
+            "price_per_unit": 102,
+            "unit": "kg",
+            "delivery_fee": 40,
+            "delivery_time": "2-4 hours",
+            "discount": 90,
+            "rating": 4.2,
+            "review_count": 1580,
+            "in_stock": True,
+            "offers": ["Buy 2 Get 5% Off", "Free Delivery above ₹200"]
+        }
+    ]
+
+# API Routes
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "Comparify API - Save money on rides & groceries"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
+# Ride comparison endpoints
+@api_router.post("/rides/compare", response_model=RideComparison)
+async def compare_rides(comparison_data: RideComparisonCreate):
+    """Compare ride prices across multiple providers"""
+    providers = generate_mock_ride_providers(
+        comparison_data.pickup_location, 
+        comparison_data.drop_location,
+        comparison_data.distance_km
+    )
+    
+    # Find best options
+    best_price = min(providers, key=lambda x: x["estimated_fare"] - x["coupon_discount"] - x["wallet_balance"])
+    best_time = min(providers, key=lambda x: int(x["estimated_time"].split("-")[0]))
+    
+    comparison = RideComparison(
+        **comparison_data.dict(),
+        providers=providers,
+        best_price_provider=best_price["provider"],
+        best_time_provider=best_time["provider"]
+    )
+    
+    # Save to database
+    await db.ride_comparisons.insert_one(comparison.dict())
+    return comparison
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
+@api_router.get("/rides/history", response_model=List[RideComparison])
+async def get_ride_history(user_id: Optional[str] = None, limit: int = 20):
+    """Get ride comparison history"""
+    query = {"user_id": user_id} if user_id else {}
+    comparisons = await db.ride_comparisons.find(query).limit(limit).sort("timestamp", -1).to_list(limit)
+    return [RideComparison(**comp) for comp in comparisons]
+
+# Grocery comparison endpoints
+@api_router.post("/groceries/compare", response_model=GroceryComparison)
+async def compare_groceries(comparison_data: GroceryComparisonCreate):
+    """Compare grocery prices across multiple providers"""
+    providers = generate_mock_grocery_providers(comparison_data.product_name)
+    
+    # Find best options
+    best_price = min(providers, key=lambda x: x["price"] + x["delivery_fee"])
+    best_delivery = min(providers, key=lambda x: int(x["delivery_time"].split("-")[0]))
+    
+    comparison = GroceryComparison(
+        **comparison_data.dict(),
+        providers=providers,
+        best_price_provider=best_price["provider"],
+        best_delivery_provider=best_delivery["provider"]
+    )
+    
+    # Save to database
+    await db.grocery_comparisons.insert_one(comparison.dict())
+    return comparison
+
+@api_router.get("/groceries/history", response_model=List[GroceryComparison])
+async def get_grocery_history(user_id: Optional[str] = None, limit: int = 20):
+    """Get grocery comparison history"""
+    query = {"user_id": user_id} if user_id else {}
+    comparisons = await db.grocery_comparisons.find(query).limit(limit).sort("timestamp", -1).to_list(limit)
+    return [GroceryComparison(**comp) for comp in comparisons]
 
 # Include the router in the main app
 app.include_router(api_router)
