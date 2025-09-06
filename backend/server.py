@@ -480,6 +480,7 @@ async def health_check():
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database connection failed: {str(e)}")
 
+# Get supported providers list
 @api_router.get("/providers")
 async def get_supported_providers():
     """Get list of supported providers"""
@@ -491,6 +492,259 @@ async def get_supported_providers():
             "food": ["Swiggy", "Zomato", "Uber Eats"]
         }
     }
+
+# AI-powered analysis endpoints
+@api_router.post("/ai/analyze-ride-comparison")
+async def analyze_ride_comparison(comparison_id: str, user_preferences: Optional[Dict] = None):
+    """Generate AI-powered analysis and recommendations for ride comparison"""
+    try:
+        # Get the comparison data
+        comparison = await db.ride_comparisons.find_one({"id": comparison_id})
+        if not comparison:
+            raise HTTPException(status_code=404, detail="Comparison not found")
+        
+        # Initialize LLM chat
+        llm_key = os.environ.get('EMERGENT_LLM_KEY')
+        chat = LlmChat(
+            api_key=llm_key,
+            session_id=f"ride_analysis_{comparison_id}",
+            system_message="You are a smart transportation advisor specializing in cost-effective and efficient travel recommendations. Analyze ride comparison data and provide actionable insights."
+        ).with_model("openai", "gpt-4o-mini")
+        
+        # Prepare analysis prompt
+        providers_data = comparison['providers']
+        analysis_prompt = f"""
+        Analyze this ride comparison for the route from {comparison['pickup_location']} to {comparison['drop_location']} (Distance: {comparison['distance_km']} km):
+
+        PROVIDERS DATA:
+        {providers_data}
+
+        USER PREFERENCES: {user_preferences or 'No specific preferences provided'}
+
+        Provide a comprehensive analysis including:
+        1. BEST VALUE RECOMMENDATION: Which option offers the best value for money considering all factors
+        2. COST BREAKDOWN INSIGHTS: Key cost factors affecting the total price 
+        3. TIME VS COST ANALYSIS: Trade-offs between speed and price
+        4. MONEY SAVING TIPS: Specific actionable advice for this route
+        5. SURGE/DEMAND INSIGHTS: Current market conditions affecting pricing
+
+        Format your response as a JSON object with these keys: recommendation, cost_insights, time_analysis, saving_tips, market_insights.
+        Keep recommendations practical and user-friendly.
+        """
+        
+        # Get AI analysis
+        user_message = UserMessage(text=analysis_prompt)
+        ai_response = await chat.send_message(user_message)
+        
+        # Store the analysis
+        analysis_record = {
+            "id": str(uuid.uuid4()),
+            "comparison_id": comparison_id,
+            "comparison_type": "ride",
+            "ai_analysis": ai_response,
+            "user_preferences": user_preferences,
+            "timestamp": datetime.utcnow()
+        }
+        await db.ai_analyses.insert_one(analysis_record)
+        
+        return {
+            "analysis_id": analysis_record["id"],
+            "comparison_id": comparison_id,
+            "ai_recommendations": ai_response,
+            "timestamp": analysis_record["timestamp"]
+        }
+        
+    except Exception as e:
+        logger.error(f"AI analysis error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI analysis failed: {str(e)}")
+
+@api_router.post("/ai/analyze-grocery-comparison")
+async def analyze_grocery_comparison(comparison_id: str, shopping_context: Optional[Dict] = None):
+    """Generate AI-powered analysis and recommendations for grocery comparison"""
+    try:
+        # Get the comparison data
+        comparison = await db.grocery_comparisons.find_one({"id": comparison_id})
+        if not comparison:
+            raise HTTPException(status_code=404, detail="Comparison not found")
+        
+        # Initialize LLM chat
+        llm_key = os.environ.get('EMERGENT_LLM_KEY')
+        chat = LlmChat(
+            api_key=llm_key,
+            session_id=f"grocery_analysis_{comparison_id}",
+            system_message="You are an expert grocery shopping advisor. Analyze product comparisons focusing on value, quality, and smart shopping strategies."
+        ).with_model("openai", "gpt-4o-mini")
+        
+        # Prepare analysis prompt
+        providers_data = comparison['providers']
+        analysis_prompt = f"""
+        Analyze this grocery comparison for {comparison['product_name']} from {comparison.get('brand', 'various')} brands:
+
+        PROVIDERS DATA:
+        {providers_data}
+
+        SHOPPING CONTEXT: {shopping_context or 'Regular shopping, no specific requirements'}
+
+        Provide detailed analysis including:
+        1. BEST VALUE PICK: Considering price per unit, quality, and total cost
+        2. UNIT PRICE INSIGHTS: Breakdown of why certain options are better value
+        3. DELIVERY OPTIMIZATION: Best delivery time vs cost balance
+        4. BULK BUYING ADVICE: Whether buying in bulk makes sense for this product
+        5. FRESHNESS & QUALITY: Considerations for product quality across providers
+        6. MONEY SAVING STRATEGIES: Specific tips for this product category
+
+        Format response as JSON with keys: best_pick, unit_analysis, delivery_insights, bulk_advice, quality_notes, saving_strategies.
+        Focus on practical, actionable shopping advice.
+        """
+        
+        # Get AI analysis
+        user_message = UserMessage(text=analysis_prompt)
+        ai_response = await chat.send_message(user_message)
+        
+        # Store the analysis
+        analysis_record = {
+            "id": str(uuid.uuid4()),
+            "comparison_id": comparison_id,
+            "comparison_type": "grocery",
+            "ai_analysis": ai_response,
+            "shopping_context": shopping_context,
+            "timestamp": datetime.utcnow()
+        }
+        await db.ai_analyses.insert_one(analysis_record)
+        
+        return {
+            "analysis_id": analysis_record["id"],
+            "comparison_id": comparison_id,
+            "ai_recommendations": ai_response,
+            "timestamp": analysis_record["timestamp"]
+        }
+        
+    except Exception as e:
+        logger.error(f"AI grocery analysis error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI analysis failed: {str(e)}")
+
+@api_router.post("/ai/personalized-recommendations")
+async def get_personalized_recommendations(user_id: str, comparison_type: ComparisonType):
+    """Generate personalized recommendations based on user's comparison history"""
+    try:
+        # Get user's comparison history
+        if comparison_type == ComparisonType.ride:
+            history = await db.ride_comparisons.find({"user_id": user_id}).limit(10).sort("timestamp", -1).to_list(10)
+        else:
+            history = await db.grocery_comparisons.find({"user_id": user_id}).limit(10).sort("timestamp", -1).to_list(10)
+        
+        if not history:
+            return {"message": "No comparison history found for personalized recommendations"}
+        
+        # Get user preferences
+        preferences = await db.user_preferences.find_one({"user_id": user_id})
+        
+        # Initialize LLM chat
+        llm_key = os.environ.get('EMERGENT_LLM_KEY')
+        chat = LlmChat(
+            api_key=llm_key,
+            session_id=f"personalized_{user_id}_{comparison_type}",
+            system_message="You are a personal finance and shopping advisor. Analyze user behavior patterns to provide personalized money-saving recommendations."
+        ).with_model("openai", "gpt-4o-mini")
+        
+        # Prepare personalization prompt
+        recommendations_prompt = f"""
+        Analyze this user's {comparison_type} comparison history and provide personalized recommendations:
+
+        COMPARISON HISTORY (last 10):
+        {history}
+
+        USER PREFERENCES:
+        {preferences or 'No preferences set'}
+
+        Based on the patterns, provide:
+        1. SPENDING PATTERNS: Key insights about their choices
+        2. SAVINGS OPPORTUNITIES: Specific ways they can save more money
+        3. PROVIDER RECOMMENDATIONS: Which providers work best for their needs
+        4. BEHAVIORAL INSIGHTS: Patterns in their decision-making
+        5. PERSONALIZED TIPS: Custom advice based on their usage
+
+        Format as JSON with keys: spending_patterns, savings_opportunities, provider_recommendations, behavioral_insights, personalized_tips.
+        Make recommendations specific and actionable.
+        """
+        
+        # Get AI recommendations
+        user_message = UserMessage(text=recommendations_prompt)
+        ai_response = await chat.send_message(user_message)
+        
+        # Store personalized insights
+        insights_record = {
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "comparison_type": comparison_type,
+            "personalized_insights": ai_response,
+            "based_on_comparisons": len(history),
+            "timestamp": datetime.utcnow()
+        }
+        await db.personalized_insights.insert_one(insights_record)
+        
+        return {
+            "insights_id": insights_record["id"],
+            "user_id": user_id,
+            "personalized_recommendations": ai_response,
+            "based_on_comparisons": len(history),
+            "timestamp": insights_record["timestamp"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Personalized recommendations error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Personalization failed: {str(e)}")
+
+@api_router.get("/ai/smart-alerts/{user_id}")
+async def generate_smart_alerts(user_id: str):
+    """Generate AI-powered smart alerts for price drops and opportunities"""
+    try:
+        # Get user's recent activity and preferences
+        recent_rides = await db.ride_comparisons.find({"user_id": user_id}).limit(5).sort("timestamp", -1).to_list(5)
+        recent_groceries = await db.grocery_comparisons.find({"user_id": user_id}).limit(5).sort("timestamp", -1).to_list(5)
+        savings_history = await db.savings_records.find({"user_id": user_id}).limit(10).sort("timestamp", -1).to_list(10)
+        
+        # Initialize LLM chat
+        llm_key = os.environ.get('EMERGENT_LLM_KEY')
+        chat = LlmChat(
+            api_key=llm_key,
+            session_id=f"smart_alerts_{user_id}",
+            system_message="You are a smart financial assistant that identifies money-saving opportunities and generates actionable alerts for users."
+        ).with_model("openai", "gpt-4o-mini")
+        
+        # Create smart alerts prompt
+        alerts_prompt = f"""
+        Generate smart money-saving alerts for this user based on their activity:
+
+        RECENT RIDES: {recent_rides}
+        RECENT GROCERIES: {recent_groceries}  
+        SAVINGS HISTORY: {savings_history}
+
+        Create personalized alerts for:
+        1. PRICE DROP OPPORTUNITIES: Items/routes that typically cost less at certain times
+        2. USAGE PATTERN ALERTS: Recommendations based on their regular patterns
+        3. SEASONAL SAVINGS: Time-based recommendations for better deals
+        4. PROVIDER SWITCHES: When they should consider different providers
+        5. BULK BUYING ALERTS: When bulk purchases make sense
+
+        Format as JSON with keys: price_alerts, pattern_alerts, seasonal_tips, provider_suggestions, bulk_opportunities.
+        Make alerts specific, actionable, and time-sensitive.
+        """
+        
+        # Get AI alerts
+        user_message = UserMessage(text=alerts_prompt)
+        ai_response = await chat.send_message(user_message)
+        
+        return {
+            "user_id": user_id,
+            "smart_alerts": ai_response,
+            "generated_at": datetime.utcnow(),
+            "expires_at": datetime.utcnow().replace(hour=23, minute=59, second=59)  # Valid until end of day
+        }
+        
+    except Exception as e:
+        logger.error(f"Smart alerts error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Smart alerts generation failed: {str(e)}")
 
 # Include the router in the main app
 app.include_router(api_router)
